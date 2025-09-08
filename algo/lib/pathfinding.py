@@ -1,6 +1,7 @@
 """
 Enhanced pathfinding with multiple algorithms for robot car navigation.
 Now includes a shortest-time Hamiltonian (TSP) solver using Dubins time as edge cost.
+Width-aware: accounts for car width by inflating obstacles/walls and using an effective turning radius.
 """
 
 import math
@@ -23,12 +24,16 @@ class PathfindingResult:
     debug_info: Dict
 
 
-# ------------ Dubins planner (unchanged geometry) -----------------
+# ------------ Dubins planner (with effective radius) -----------------
 class DubinsPlanner:
     """Plans Dubins paths for car-like robot motion."""
 
     def __init__(self, turning_radius: float = None):
-        self.turning_radius = turning_radius or config.car.turning_radius
+        base_r = turning_radius or config.car.turning_radius
+        half_w = 0.5 * getattr(config.car, "width", 0.0)
+        # Plan with a larger radius so the outer edge of the car clears during arcs
+        self.turning_radius = base_r + half_w
+        
 
     def plan_path(self, start: CarState, goal: CarState) -> Optional[DubinsPath]:
         """Plan shortest Dubins path between two car states. Returns None if no valid path exists."""
@@ -205,31 +210,49 @@ class DubinsPlanner:
         return DubinsPath(DubinsPathType.LRL, length, start, goal, waypoints, turn_points)
 
     def _arc_angle(self, px: float, py: float, cx: float, cy: float,
-                   qx: float, qy: float, clockwise: bool) -> float:
-        v1x, v1y = px - cx, py - cy
-        v2x, v2y = qx - cx, qy - cy
-        angle = math.atan2(v2y, v2x) - math.atan2(v1y, v1x)
+                qx: float, qy: float, clockwise: bool) -> float:
+        """
+        Return the signed sweep to go from point P on the circle (center C)
+        to point Q on the same circle, following the requested direction.
+        - CCW  : +angle in [0, 2π)
+        - CW   : -angle in (−2π, 0]
+        This prevents “extra revolutions” (e.g., −2π − ε) that make the car spin.
+        """
+        a1 = math.atan2(py - cy, px - cx)   # angle of P around C
+        a2 = math.atan2(qy - cy, qx - cx)   # angle of Q around C
+        twopi = 2.0 * math.pi
+
         if clockwise:
-            if angle > 0:
-                angle -= 2 * math.pi
+            # going CW means decreasing angle; take shortest CW sweep
+            sweep = (a1 - a2) % twopi       # in [0, 2π)
+            # return negative (CW) sweep; map 0 to 0, others to (-2π, 0]
+            return -sweep if sweep != 0.0 else 0.0
         else:
-            if angle < 0:
-                angle += 2 * math.pi
-        return angle
+            # CCW: increasing angle; take shortest CCW sweep
+            sweep = (a2 - a1) % twopi       # in [0, 2π)
+            return sweep if sweep != 0.0 else 0.0
+
 
 
 # ------------------- High-level planner with TSP -------------------
 class CarPathPlanner:
-    """Path planner with several strategies. Prefers shortest-time Hamiltonian (Held–Karp)."""
-
     def __init__(self):
         self.dubins_planner = DubinsPlanner()
         self.arena_size = config.arena.size
         self.grid_size = config.get_grid_size()
         self.obstacles: List[Obstacle] = []
-
+        
         # Collision grid (1 = blocked, 0 = free)
         self.collision_grid = np.zeros((self.grid_size, self.grid_size), dtype=int)
+
+        # FIXED: More reasonable clearance calculation
+        safety = getattr(config.car, "safety_margin_cm", 2.0)
+        self.clearance_cm = 0.5 * getattr(config.car, "width", 30.0) + safety
+        # For collision detection, use a smaller buffer to avoid over-conservative paths
+        self.collision_clearance_cells = max(1, int(math.ceil((self.clearance_cm * 0.7) / config.arena.grid_cell_size)))
+        
+        print(f"Car clearance: {self.clearance_cm}cm")
+        print(f"Collision clearance: {self.collision_clearance_cells} cells")
 
     # ---- world / obstacle management ----
     def add_obstacle(self, x: int, y: int, image_side: str):
@@ -238,16 +261,51 @@ class CarPathPlanner:
         self._update_collision_grid()
         print(f"Added obstacle {len(self.obstacles)-1} at ({x}, {y}) with image on {image_side} side")
 
+
     def _update_collision_grid(self):
+        """FIXED: More reasonable collision grid with proper buffers."""
         self.collision_grid.fill(0)
-        buffer = config.arena.collision_buffer
         cell = config.arena.grid_cell_size
-        for obs in self.obstacles:
-            min_x = max(0, (obs.x - buffer) // cell)
-            max_x = min(self.grid_size, (obs.x + config.arena.obstacle_size + buffer) // cell)
-            min_y = max(0, (obs.y - buffer) // cell)
-            max_y = min(self.grid_size, (obs.y + config.arena.obstacle_size + buffer) // cell)
-            self.collision_grid[min_y:max_y, min_x:max_x] = 1
+
+        # Use smaller, more realistic buffers
+        obstacle_buffer_cm = 5.0  # Reduced from 8cm
+        obstacle_buffer_cells = max(1, int(math.ceil(obstacle_buffer_cm / cell)))
+        
+        # Border buffer - just enough to keep car body clear
+        border_buffer_cm = self.clearance_cm * 0.8  # Reduced multiplier
+        border_buffer_cells = max(1, int(math.ceil(border_buffer_cm / cell)))
+
+        print(f"Using obstacle buffer: {obstacle_buffer_cm}cm ({obstacle_buffer_cells} cells)")
+        print(f"Using border buffer: {border_buffer_cm}cm ({border_buffer_cells} cells)")
+
+        # Inflate obstacles
+        for i, obs in enumerate(self.obstacles):
+            obs_min_gx = int(obs.x // cell)
+            obs_max_gx = int((obs.x + config.arena.obstacle_size) // cell)
+            obs_min_gy = int(obs.y // cell)  
+            obs_max_gy = int((obs.y + config.arena.obstacle_size) // cell)
+            
+            min_gx = max(0, obs_min_gx - obstacle_buffer_cells)
+            max_gx = min(self.grid_size, obs_max_gx + obstacle_buffer_cells + 1)
+            min_gy = max(0, obs_min_gy - obstacle_buffer_cells)
+            max_gy = min(self.grid_size, obs_max_gy + obstacle_buffer_cells + 1)
+            
+            for gy in range(min_gy, max_gy):
+                for gx in range(min_gx, max_gx):
+                    if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
+                        self.collision_grid[gy, gx] = 1
+
+        # Inflate arena borders (more conservative at edges)
+        if border_buffer_cells < self.grid_size // 2:
+            self.collision_grid[0:border_buffer_cells, :] = 1
+            self.collision_grid[self.grid_size - border_buffer_cells:, :] = 1
+            self.collision_grid[:, 0:border_buffer_cells] = 1
+            self.collision_grid[:, self.grid_size - border_buffer_cells:] = 1
+
+        blocked_count = np.sum(self.collision_grid)
+        total_cells = self.grid_size * self.grid_size
+        blocked_percentage = 100 * blocked_count / total_cells
+        print(f"Collision grid: {blocked_count}/{total_cells} blocked ({blocked_percentage:.1f}%)")
 
     def get_image_target_position(self, obstacle: Obstacle) -> CarState:
         """Pose where the robot should be to scan the image."""
@@ -419,7 +477,8 @@ class CarPathPlanner:
         """
         v_lin = max(1e-6, config.car.linear_speed_cm_s)
         omega = max(1e-6, config.car.angular_speed_rad_s)
-        r = max(1e-6, config.car.turning_radius)
+        # Use effective radius (includes half-width)
+        r = max(1e-6, self.dubins_planner.turning_radius)
 
         # Straight length: only if the middle segment is 'S'
         straight_len = 0.0
@@ -442,28 +501,111 @@ class CarPathPlanner:
         return self._path_intersects_obstacles_strict(path, buffer_reduction=0)
 
     def _path_intersects_obstacles_strict(self, path: DubinsPath, buffer_reduction: float = 0) -> bool:
-        for i in range(len(path.waypoints) - 1):
-            x1, y1 = path.waypoints[i]
-            x2, y2 = path.waypoints[i + 1]
-            steps = max(3, int(math.hypot(x2 - x1, y2 - y1) / 10))
-            for step in range(steps + 1):
-                t = step / steps if steps > 0 else 0
-                x = x1 + t * (x2 - x1)
-                y = y1 + t * (y2 - y1)
-                buffer = max(1, int((config.arena.collision_buffer * (1 - buffer_reduction)) // config.arena.grid_cell_size))
-                gx = int(x / config.arena.grid_cell_size)
-                gy = int(y / config.arena.grid_cell_size)
-                if (gx < buffer or gx >= self.grid_size - buffer or
-                        gy < buffer or gy >= self.grid_size - buffer):
-                    return True
-                for dx in range(-buffer, buffer + 1):
-                    for dy in range(-buffer, buffer + 1):
-                        cx = gx + dx
-                        cy = gy + dy
-                        if (0 <= cx < self.grid_size and 0 <= cy < self.grid_size and
-                                self.collision_grid[cy, cx] == 1):
-                            return True
+        """FIXED: Proper circular collision detection instead of square."""
+        cell = config.arena.grid_cell_size
+        check_radius_cells = max(1, int(self.collision_clearance_cells * (1 - buffer_reduction)))
+        
+        def is_collision_at_point(x: float, y: float) -> bool:
+            gx = int(x / cell)
+            gy = int(y / cell)
+            
+            # Check arena bounds
+            if (gx < check_radius_cells or gx >= self.grid_size - check_radius_cells or
+                gy < check_radius_cells or gy >= self.grid_size - check_radius_cells):
+                return True
+            
+            # FIXED: Check circular region instead of square
+            for dx in range(-check_radius_cells, check_radius_cells + 1):
+                for dy in range(-check_radius_cells, check_radius_cells + 1):
+                    # Only check points within circular distance
+                    if dx*dx + dy*dy <= check_radius_cells * check_radius_cells:
+                        check_gx = gx + dx
+                        check_gy = gy + dy
+                        if (0 <= check_gx < self.grid_size and 0 <= check_gy < self.grid_size):
+                            if self.collision_grid[check_gy, check_gx] == 1:
+                                return True
+            return False
+
+        def sample_line(p1, p2, samples=8):
+            """Sample points along a line segment."""
+            points = []
+            for i in range(samples + 1):
+                t = i / samples
+                x = p1[0] + t * (p2[0] - p1[0])
+                y = p1[1] + t * (p2[1] - p1[1])
+                points.append((x, y))
+            return points
+
+        def sample_arc(center, start_point, end_point, turn_direction, samples=12):
+            """Sample points along an arc."""
+            cx, cy = center
+            r = self.dubins_planner.turning_radius
+            
+            a0 = math.atan2(start_point[1] - cy, start_point[0] - cx)
+            a1 = math.atan2(end_point[1] - cy, end_point[0] - cx)
+            
+            if turn_direction == 'l':
+                if a1 <= a0: a1 += 2 * math.pi
+                angles = [a0 + (a1 - a0) * i / samples for i in range(samples + 1)]
+            else:
+                if a0 <= a1: a0 += 2 * math.pi
+                angles = [a0 - (a0 - a1) * i / samples for i in range(samples + 1)]
+                
+            points = []
+            for angle in angles:
+                x = cx + r * math.cos(angle)
+                y = cy + r * math.sin(angle)
+                points.append((x, y))
+            
+            return points
+
+        # Check path segments
+        wps = path.waypoints
+        if len(wps) < 4:
+            return False
+            
+        ptype = (path.path_type.value if hasattr(path.path_type, "value") else str(path.path_type)).lower()
+        
+        all_sample_points = []
+        
+        # Segment 0
+        if ptype[0] in ('l', 'r'):
+            center = self._circle_center(wps[0], path.start_state.theta, ptype[0])
+            points = sample_arc(center, wps[0], wps[1], ptype[0])
+            all_sample_points.extend(points)
+        else:
+            points = sample_line(wps[0], wps[1])
+            all_sample_points.extend(points)
+
+        # Segment 1 (straight)
+        points = sample_line(wps[1], wps[2])
+        all_sample_points.extend(points)
+
+        # Segment 2
+        if ptype[2] in ('l', 'r'):
+            center = self._circle_center(wps[3], path.end_state.theta, ptype[2])
+            points = sample_arc(center, wps[2], wps[3], ptype[2])
+            all_sample_points.extend(points)
+        else:
+            points = sample_line(wps[2], wps[3])
+            all_sample_points.extend(points)
+
+        # Check all sample points
+        for x, y in all_sample_points:
+            if is_collision_at_point(x, y):
+                return True
+                
         return False
+
+    def _circle_center(self, point, heading, turn_char):
+        """Helper to calculate circle center for turns."""
+        r = self.dubins_planner.turning_radius
+        x, y = point
+        if turn_char.lower() == 'l':
+            return (x - r * math.sin(heading), y + r * math.cos(heading))
+        else:
+            return (x + r * math.sin(heading), y - r * math.cos(heading))
+
 
     # -------- legacy strategies kept as fallbacks --------
     def _greedy_nearest_neighbor(self, start_state: CarState, obstacle_indices: List[int]) -> PathfindingResult:
@@ -499,7 +641,7 @@ class CarPathPlanner:
         return PathfindingResult(path_segments, total_length, "greedy_nearest_neighbor", {"segments": len(path_segments)})
 
     def _exhaustive_search(self, start_state: CarState, obstacle_indices: List[int]) -> PathfindingResult:
-        if len(obstacle_indices) > 5:
+        if len(obstacle_indices) > 8:
             return PathfindingResult([], 0, "exhaustive_search", {"error": "too_many_targets"})
         targets = []
         for idx in obstacle_indices:
@@ -553,6 +695,66 @@ class CarPathPlanner:
             else:
                 print(f"Warning: Could not plan path to obstacle {obs_idx}")
         return PathfindingResult(path_segments, total, "fallback_simple", {"segments": len(path_segments), "warnings": True})
+    
+    # Add this debugging method to CarPathPlanner class in pathfinding.py
+
+    def debug_collision_grid(self):
+        """Print collision grid state for debugging."""
+        print(f"Collision grid shape: {self.collision_grid.shape}")
+        print(f"Grid cell size: {config.arena.grid_cell_size}cm")
+        print(f"Clearance: {self.clearance_cm}cm ({self.clearance_cm} cells)")
+        print(f"Arena size: {config.arena.size}cm")
+        
+        # Print grid (flip y for proper visualization)
+        print("\nCollision Grid (1=blocked, 0=free):")
+        for y in range(self.grid_size-1, -1, -1):  # top to bottom
+            row = ""
+            for x in range(self.grid_size):
+                row += "█" if self.collision_grid[y, x] == 1 else "·"
+            print(f"{y:2d}: {row}")
+        
+        print("    " + "".join([str(i%10) for i in range(self.grid_size)]))
+
+    def debug_path_collision(self, path: DubinsPath):
+        """Debug why a specific path might be colliding."""
+        print(f"\nDebugging path collision for {path.path_type.value}")
+        print(f"Path length: {path.length:.1f}cm")
+        print(f"Waypoints: {path.waypoints}")
+        
+        cell = config.arena.grid_cell_size
+        boundary_buf = max(1, int(self.clearance_cm))
+        
+        collision_points = []
+        
+        # Sample the path and check each point
+        def check_point(x, y, label):
+            gx = int(x / cell)
+            gy = int(y / cell)
+            print(f"  {label}: world({x:.1f}, {y:.1f}) -> grid({gx}, {gy})")
+            
+            if (gx < boundary_buf or gx >= self.grid_size - boundary_buf or
+                gy < boundary_buf or gy >= self.grid_size - boundary_buf):
+                print(f"    -> BOUNDARY COLLISION")
+                collision_points.append((x, y, "boundary"))
+                return True
+                
+            for dx in range(-boundary_buf, boundary_buf + 1):
+                for dy in range(-boundary_buf, boundary_buf + 1):
+                    cx = gx + dx
+                    cy = gy + dy
+                    if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size:
+                        if self.collision_grid[cy, cx] == 1:
+                            print(f"    -> OBSTACLE COLLISION at grid({cx}, {cy})")
+                            collision_points.append((x, y, "obstacle"))
+                            return True
+            print(f"    -> OK")
+            return False
+        
+        # Check waypoints
+        for i, (x, y) in enumerate(path.waypoints):
+            check_point(x, y, f"waypoint_{i}")
+        
+        return collision_points
 
 
 if __name__ == "__main__":

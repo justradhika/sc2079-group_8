@@ -1,7 +1,8 @@
 import pygame
 import math
 import sys
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+import time
 
 from lib.car import CarState, CarAction
 from lib.path import Obstacle, DubinsPath, DubinsPathType
@@ -37,7 +38,7 @@ class ImprovedCarVisualizer:
 
         self.obstacles: List[Obstacle] = []
         self.planned_paths: List[DubinsPath] = []
-        self.car_state: CarState | None = None
+        self.car_state: Optional[CarState] = None
         self.target_positions: List[CarState] = []
         self.car_trail: List[CarState] = []
         self.current_target_highlight = -1
@@ -48,6 +49,13 @@ class ImprovedCarVisualizer:
         self.show_grid = True; self.show_paths = True; self.show_waypoints = True
         self.show_turning_circles = False
         self.animation_speed = 1
+
+        # --- timer ---
+        self.start_time: Optional[float] = None
+        self.elapsed_time: float = 0.0
+        # Optional countdown (seconds). Set in config as `time_limit_sec`, or leave None.
+        self.time_limit_sec: Optional[float] = getattr(config, "time_limit_sec", None)
+        self.finished: bool = False
 
     # ---------- transforms ----------
 
@@ -62,7 +70,7 @@ class ImprovedCarVisualizer:
     def draw_grid(self):
         if not self.show_grid:
             return
-        grid = 20
+        grid = 10
         for i in range(0, self.arena_size + 1, grid):
             sx1, sy1 = self.world_to_screen(i, 0); sx2, sy2 = self.world_to_screen(i, self.arena_size)
             pygame.draw.line(self.screen, Colors.LIGHT_GRAY, (sx1, sy1), (sx2, sy2))
@@ -262,7 +270,7 @@ class ImprovedCarVisualizer:
         for c in ctrls:
             self.screen.blit(self.small_font.render(c, True, Colors.BLACK), (10, y)); y += 18
 
-        panel_x = self.screen_width - 300; panel_y = 10; pw = 280; ph = 200
+        panel_x = self.screen_width - 300; panel_y = 10; pw = 280; ph = 240  # taller to fit timer
         pygame.draw.rect(self.screen, Colors.LIGHT_GRAY, (panel_x, panel_y, pw, ph))
         pygame.draw.rect(self.screen, Colors.BLACK, (panel_x, panel_y, pw, ph), 2)
 
@@ -276,7 +284,20 @@ class ImprovedCarVisualizer:
                 color = Colors.CYAN if "SCANNING" in ln else Colors.BLACK
                 self.screen.blit(self.small_font.render(ln, True, color), (panel_x + 10, panel_y + 15 + i * 18))
 
-        msg_y = panel_y + 120
+        # --- timer block ---
+        ty = panel_y + 15 + 5 * 18
+        timer_label = f"Elapsed: {self.elapsed_time:5.1f}s"
+        self.screen.blit(self.small_font.render(timer_label, True, Colors.BLACK), (panel_x + 10, ty))
+        if self.time_limit_sec is not None:
+            remaining = max(0.0, self.time_limit_sec - self.elapsed_time)
+            rem_label = f"Remaining: {remaining:5.1f}s"
+            self.screen.blit(self.small_font.render(rem_label, True, Colors.BLACK), (panel_x + 10, ty + 18))
+        if self.finished:
+            self.screen.blit(self.small_font.render("Mission complete!", True, Colors.DARK_BLUE),
+                             (panel_x + 10, ty + 36))
+
+        # recent messages
+        msg_y = panel_y + 160
         for i, msg in enumerate(self.status_messages[-4:]):
             self.screen.blit(self.small_font.render(msg, True, Colors.DARK_BLUE), (panel_x + 10, msg_y + i * 18))
 
@@ -306,9 +327,15 @@ class ImprovedCarVisualizer:
 
     def reset(self):
         self.car_trail = []; self.status_messages = []
-        if self.car_state: self.car_trail.append(CarState(self.car_state.x, self.car_state.y, self.car_state.theta))
+        if self.car_state:
+            self.car_trail.append(CarState(self.car_state.x, self.car_state.y, self.car_state.theta))
+        # timer reset
+        self.start_time = time.time()
+        self.elapsed_time = 0.0
+        self.finished = False
 
-    def update(self): pass
+    def update(self): 
+        pass
 
     def render(self):
         self.screen.fill(Colors.WHITE)
@@ -325,10 +352,21 @@ class ImprovedCarVisualizer:
     def run(self):
         while self.running:
             self.handle_events()
+
+            # --- timer: keep it running unless mission finished ---
+            if self.start_time is not None and not self.finished:
+                self.elapsed_time = time.time() - self.start_time
+
             if not self.paused:
-                for _ in range(self.animation_speed): self.update()
-            self.render(); self.clock.tick(60)
-        pygame.quit(); sys.exit()
+                for _ in range(self.animation_speed):
+                    self.update()
+
+            self.render()
+            self.clock.tick(60)
+
+        pygame.quit()
+        sys.exit()
+
 
 
 class EnhancedCarSimulation(ImprovedCarVisualizer):
@@ -342,42 +380,79 @@ class EnhancedCarSimulation(ImprovedCarVisualizer):
         self.step_delay = 0
 
     def setup_simulation(self):
+        self.start_time = time.time()
+        self.elapsed_time = 0.0
+        self.finished = False
+
         self.manager = CarMissionManager()
         self.manager.initialize_car(20, 20, 0)
 
-        # You can tweak these to force tight maneuvers / reversing if RS planner is enabled.
         # Slightly spread out; still forward-friendly
         obstacle_configs = [
-        (85, 95, 'E'),   # target ~ (98.0, 97.5), heading π (face west)
-        (100, 95, 'W'),  # target ~ (92.0, 97.5), heading 0 (face east)
-        (140, 60, 'N'),
-        (60, 140, 'S'),
+            (50, 70, 'S'),
+            (50, 130, 'W'),
+            (120, 90, 'E'),
+            (150, 40, 'N'),
+            (150, 150, 'S'),
+            (100, 190, 'S')
         ]
         for x, y, side in obstacle_configs:
             self.manager.add_obstacle(x, y, side)
             self.obstacles.append(Obstacle(x, y, side))
 
-        target_indices = [0, 1, 2, 3]
+        self.debug_setup()
+
+        # Visit ALL obstacles that were added
+        target_indices = list(range(len(self.manager.path_planner.obstacles)))
         if self.manager.plan_mission(target_indices):
             self.planned_paths = self.manager.controller.current_path
             self.add_status_message("Mission planned successfully!")
             self.target_positions = [self.manager.path_planner.get_image_target_position(o)
                                      for o in self.manager.path_planner.obstacles]
+            # start timer
+            self.start_time = time.time()
+            self.elapsed_time = 0.0
+            self.finished = False
         else:
             self.add_status_message("Mission planning failed!")
 
         self.car_state = self.manager.car_status.estimated_state
         self.car_trail = [CarState(self.car_state.x, self.car_state.y, self.car_state.theta)]
 
+    def debug_setup(self):
+        """Add debugging output to simulation setup."""
+        print("=== DEBUGGING COLLISION DETECTION ===")
+        
+        # Print collision grid
+        self.manager.path_planner.debug_collision_grid()
+        
+        # Test a simple path that should collide
+        start = CarState(20, 20, 0)
+        end = CarState(180, 180, 0)  # This should go through obstacles
+        
+        test_path = self.manager.path_planner.dubins_planner.plan_path(start, end)
+        if test_path:
+            collision_points = self.manager.path_planner.debug_path_collision(test_path)
+            collides = self.manager.path_planner._path_intersects_obstacles_strict(test_path)
+            print(f"Test path collision result: {collides}")
+            print(f"Collision points found: {len(collision_points)}")
+        
+        print("=" * 45)
+
     def update(self):
-        if self.simulation_step >= self.max_steps: return
+        if self.simulation_step >= self.max_steps:
+            return
+
         cmd = self.manager.get_next_action()
         if not cmd:
-            self.add_status_message("No more commands"); return
+            self.add_status_message("No more commands")
+            return
         if cmd.action == CarAction.STOP:
             self.add_status_message("Mission complete!")
+            self.finished = True
 
         result = self.manager.execute_command(cmd)
+
         self.car_state = self.manager.car_status.estimated_state
         self.car_trail.append(CarState(self.car_state.x, self.car_state.y, self.car_state.theta))
 
@@ -388,7 +463,8 @@ class EnhancedCarSimulation(ImprovedCarVisualizer):
 
         if cmd.action == CarAction.FORWARD:
             d = cmd.parameters.get('distance', 0)
-            if d > 0: self.add_status_message(f"Forward {d:.1f}cm")
+            if d > 0:
+                self.add_status_message(f"Forward {d:.1f}cm")
         elif cmd.action in (CarAction.TURN_LEFT, CarAction.TURN_RIGHT):
             ang = cmd.parameters.get('angle', 0)
             self.add_status_message(f"Turn {'left' if cmd.action==CarAction.TURN_LEFT else 'right'} {math.degrees(ang):.1f}°")
@@ -410,6 +486,6 @@ if __name__ == "__main__":
     print("- True Dubins curves (rendered)")
     print("- Smooth controller (curvature & P-control)")
     print("- Image recognition stops")
-    print("- Real-time status")
+    print("- Real-time status + timer")
     simulation = EnhancedCarSimulation()
     simulation.run()

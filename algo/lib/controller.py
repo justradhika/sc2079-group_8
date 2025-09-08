@@ -13,10 +13,28 @@ from config import config
 from lib.path import DubinsPath, DubinsPathType
 from lib.pathfinding import CarPathPlanner
 
+
+def _arc_sweep_signed(px: float, py: float,
+                      cx: float, cy: float,
+                      qx: float, qy: float,
+                      clockwise: bool) -> float:
+    """Compute the exact signed sweep for an arc."""
+    a1 = math.atan2(py - cy, px - cx)
+    a2 = math.atan2(qy - cy, qx - cx)
+    twopi = 2.0 * math.pi
+    if clockwise:
+        sweep = (a1 - a2) % twopi
+        return -sweep if sweep != 0.0 else 0.0
+    else:
+        sweep = (a2 - a1) % twopi
+        return sweep if sweep != 0.0 else 0.0
+
+
 class DubinsSegmentType(Enum):
     LEFT_TURN = "L"
     RIGHT_TURN = "R"
     STRAIGHT = "S"
+
 
 @dataclass
 class DubinsSegmentInfo:
@@ -28,6 +46,7 @@ class DubinsSegmentInfo:
     end_heading: float
     center_point: Optional[Tuple[float, float]] = None
 
+
 @dataclass
 class CarStatus:
     estimated_state: CarState
@@ -37,7 +56,7 @@ class CarStatus:
 
 
 class DubinsAwareController:
-    """Controller that follows Dubins path geometry with proper arc movement."""
+    """FIXED: Controller that doesn't get stuck circling."""
 
     def __init__(self):
         self.waypoint_tolerance = config.pathfinding.waypoint_tolerance
@@ -50,6 +69,11 @@ class DubinsAwareController:
         self.current_segment: Optional[DubinsSegmentInfo] = None
         self.image_recognition_time: int = 0
         self.at_target: bool = False
+        
+        # FIXED: Add state to prevent endless circling
+        self.consecutive_turns = 0
+        self.last_heading_error = None
+        self.stuck_counter = 0
 
     def set_path(self, path_segments: List[DubinsPath]):
         self.current_path = path_segments
@@ -86,7 +110,11 @@ class DubinsAwareController:
                 self.image_recognition_time = 20
             if self.image_recognition_time > 0:
                 self.image_recognition_time -= 1
-                return CarCommand(CarAction.STOP, {"reason": "image_recognition", "frames_remaining": self.image_recognition_time}, current_state)
+                return CarCommand(
+                    CarAction.STOP,
+                    {"reason": "image_recognition", "frames_remaining": self.image_recognition_time},
+                    current_state
+                )
             # move on
             self.path_index += 1
             self.current_segment = None
@@ -101,7 +129,7 @@ class DubinsAwareController:
 
         return self._generate_dubins_command(current_state)
 
-    # ---- segment helpers (same as your working version) ----
+    # ---- segment helpers ----
     def _initialize_first_segment(self, dubins_path: DubinsPath) -> Optional[DubinsSegmentInfo]:
         path_type = dubins_path.path_type.value.lower()
         waypoints = dubins_path.waypoints
@@ -189,41 +217,112 @@ class DubinsAwareController:
         return self._cmd_arc(current_state)
 
     def _cmd_straight(self, current_state: CarState) -> CarCommand:
+        """FIXED: Better heading correction that doesn't cause circling."""
         end_x, end_y = self.current_segment.end_point
-        target_heading = math.atan2(end_y - current_state.y, end_x - current_state.x)
-        heading_error = angle_difference(current_state.theta, target_heading)
 
-        if abs(heading_error) > self.angle_tolerance * 2:
-            turn_amount = min(abs(heading_error), 0.2)
-            if heading_error > 0:
+        heading_err = angle_difference(current_state.theta, self.current_segment.end_heading)
+        angle_needed = abs(heading_err)
+
+        # FIXED: Track if we're making progress on heading correction
+        if self.last_heading_error is not None:
+            if abs(angle_needed - self.last_heading_error) < math.radians(5):
+                self.stuck_counter += 1
+            else:
+                self.stuck_counter = 0
+        self.last_heading_error = angle_needed
+
+        # FIXED: If stuck circling, just move forward
+        if self.stuck_counter > 3:
+            print("Controller: Breaking out of heading correction loop")
+            self.stuck_counter = 0
+            self.consecutive_turns = 0
+            distance_to_end = math.hypot(end_x - current_state.x, end_y - current_state.y)
+            move_distance = min(distance_to_end, self.max_forward_step)
+            expected_x = current_state.x + move_distance * math.cos(current_state.theta)
+            expected_y = current_state.y + move_distance * math.sin(current_state.theta)
+            return CarCommand(
+                CarAction.FORWARD,
+                {"distance": move_distance},
+                CarState(expected_x, expected_y, current_state.theta)
+            )
+
+        MAX_TURN_ONCE = math.radians(45)  # FIXED: Smaller max turn
+        SIGNIFICANT_ERROR = math.radians(15)  # FIXED: More tolerant threshold
+
+        # FIXED: More tolerant heading correction
+        if angle_needed > SIGNIFICANT_ERROR:
+            # Limit consecutive turns
+            if self.consecutive_turns >= 2:
+                print("Controller: Limiting consecutive turns, moving forward")
+                self.consecutive_turns = 0
+                distance_to_end = math.hypot(end_x - current_state.x, end_y - current_state.y)
+                move_distance = min(distance_to_end, self.max_forward_step * 0.5)
+                expected_x = current_state.x + move_distance * math.cos(current_state.theta)
+                expected_y = current_state.y + move_distance * math.sin(current_state.theta)
+                return CarCommand(
+                    CarAction.FORWARD,
+                    {"distance": move_distance},
+                    CarState(expected_x, expected_y, current_state.theta)
+                )
+
+            turn_amount = min(angle_needed, MAX_TURN_ONCE)
+            self.consecutive_turns += 1
+            
+            if heading_err > 0:
                 new_theta = normalize_angle(current_state.theta + turn_amount)
-                return CarCommand(CarAction.TURN_LEFT, {"angle": turn_amount}, CarState(current_state.x, current_state.y, new_theta))
+                return CarCommand(
+                    CarAction.TURN_LEFT,
+                    {"angle": turn_amount},
+                    CarState(current_state.x, current_state.y, new_theta),
+                )
             else:
                 new_theta = normalize_angle(current_state.theta - turn_amount)
-                return CarCommand(CarAction.TURN_RIGHT, {"angle": turn_amount}, CarState(current_state.x, current_state.y, new_theta))
+                return CarCommand(
+                    CarAction.TURN_RIGHT,
+                    {"angle": turn_amount},
+                    CarState(current_state.x, current_state.y, new_theta),
+                )
 
+        # Heading is good enough - move forward
+        self.consecutive_turns = 0
         distance_to_end = math.hypot(end_x - current_state.x, end_y - current_state.y)
-        move_distance = min(distance_to_end, self.max_forward_step * 1.5)
+        move_distance = min(distance_to_end, self.max_forward_step)
         expected_x = current_state.x + move_distance * math.cos(current_state.theta)
         expected_y = current_state.y + move_distance * math.sin(current_state.theta)
-        return CarCommand(CarAction.FORWARD, {"distance": move_distance}, CarState(expected_x, expected_y, current_state.theta))
+        return CarCommand(
+            CarAction.FORWARD,
+            {"distance": move_distance},
+            CarState(expected_x, expected_y, current_state.theta)
+        )
+
 
     def _cmd_arc(self, current_state: CarState) -> CarCommand:
+        """FIXED: Simpler arc following."""
         cx, cy = self.current_segment.center_point
-        cur_ang = math.atan2(current_state.y - cy, current_state.x - cx)
-        angular_step = self.max_forward_step / self.turning_radius
+        
+        # FIXED: Use smaller angular steps to avoid overshooting
+        angular_step = self.max_forward_step / (self.turning_radius * 1.5)  # Smaller steps
         direction = +1 if self.current_segment.segment_type == DubinsSegmentType.LEFT_TURN else -1
+        
+        cur_ang = math.atan2(current_state.y - cy, current_state.x - cx)
         target_angle = cur_ang + direction * angular_step
+
         new_x = cx + self.turning_radius * math.cos(target_angle)
         new_y = cy + self.turning_radius * math.sin(target_angle)
+
         if self.current_segment.segment_type == DubinsSegmentType.LEFT_TURN:
             new_theta = normalize_angle(target_angle + math.pi / 2)
             action = CarAction.TURN_LEFT
         else:
             new_theta = normalize_angle(target_angle - math.pi / 2)
             action = CarAction.TURN_RIGHT
+
         turn_angle = abs(angle_difference(current_state.theta, new_theta))
-        return CarCommand(action, {"angle": turn_angle, "arc_movement": True}, CarState(new_x, new_y, new_theta))
+        return CarCommand(
+            action,
+            {"angle": turn_angle, "arc_movement": True},
+            CarState(new_x, new_y, new_theta)
+        )
 
     # ---- public status/update ----
     def update_car_position(self, car_status: CarStatus, executed_command: CarCommand, actual_result: Dict[str, Any] = None) -> CarStatus:
